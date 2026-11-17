@@ -1,0 +1,489 @@
+---
+title: "District-Relative Rent Tier Classification in Madrid"
+subtitle: "A Regression-to-Classification Pipeline with Tidymodels"
+author: "Ning Tian"
+format:
+  pdf:
+    number-sections: true
+    geometry: "margin=2cm"
+    fontsize: 10.5pt
+    fig-pos: "H"
+    colorlinks: true
+execute:
+  echo: false
+  warning: false
+  message: false
+bibliography: refs.bib
+nocite: |
+  @*
+---
+
+```{r}
+#| label: setup
+#| cache: false
+
+pkgs <- c(
+  "stringi",
+  "vip",
+  "workflowsets",
+  "finetune",
+  "xgboost",
+  "knitr",
+  "kableExtra",
+  "embed",
+  "BiocManager"
+)
+for (p in pkgs) {
+  if (!require(p,character.only = TRUE)) {
+    install.packages(p)
+  }
+}
+
+library(tidyverse)
+library(tidymodels)
+library(stringi)
+library(future)
+library(vip)
+library(patchwork)
+library(workflowsets)
+library(finetune)
+library(knitr)
+library(kableExtra)
+library(embed)
+library(mixOmics)
+```
+
+```{r}
+#| label: data-load
+#| cache: true
+
+raw_data <- read_csv("houses_madrid.csv", show_col_types = FALSE)
+set.seed(20260513)
+raw_data <- raw_data |>
+  group_by(subtitle) |>
+  slice_sample(prop = 10000 / nrow(raw_data)) |>
+  ungroup()
+```
+
+# Introduction
+
+Madrid's rental market is strongly segmented by location: a flat in Salamanca can easily rent for twice times a comparable property in Puente de Vallecas. This makes absolute price prediction less informative for renters trying to assess whether a listing is good value. The question I want to answer is: given a property's observable features, is it priced *Low*, *Fair*, or *High* relative to its own district?
+
+The approach is a two stage pipeline. First, I train regression models to predict `rent_price` directly. The predicted value is then converted to a price tier using district specific quartile boundaries, these boundaries are computed entirely on the training set, so there is no leakage from the test data. I compare three models: Elastic Net, Random Forest, and XGBoost. All three are tuned using race-ANOVA elimination [@finetune] inside a unified `workflow_set`, which makes the comparison straightforward and reproducible.
+
+# Data
+
+## Overview
+
+The dataset `houses_madrid.csv` contains rental listings scraped from Idealista. After stratified sampling (preserving representation across neighbourhoods), the working dataset has around **9924 properties** and 58 input features before preprocessing. @tbl-vars lists the main variable groups.
+
+```{r}
+#| label: tbl-vars
+#| tbl-cap: "Variable groups used in modelling."
+
+tibble::tribble(
+  ~Group, ~Examples,
+  "Size", "sq_mt_built, sq_mt_useful, total_room",
+  "Location", "district, floor",
+  "Amenities", "has_ac, has_lift, has_parking, ...", 
+  "Property type", "house_type_id, is_new_development",
+  "Energy", "energy_certificate, heating_type", 
+  "Target", "rent_price -> Low / Fair / High"
+) |>
+  kable(booktabs = TRUE, linesep = "") |>
+  kable_styling(font_size = 8, latex_options = "hold_position")
+```
+
+The target variable is constructed by grouping properties within each district and labelling those below the 25th percentile as *Low*, above the 75th as *High*, and everything in between as *Fair*.
+
+# Preprocessing and Feature Engineering
+
+## Manual transformations
+
+Before building the models, I need to clean up the raw columns to remove text noise and redundant features. First, I use `stri_trans_general()` from the stringi package [@stringi] to strip accents from all text. This standardizes the Spanish characters and stops encoding errors when the file runs on different computers. Next, I use a regular expression to split the messy `neighborhood_id` column into three clean fields: `barrio`, `avg_m2_price`, and `district`. I also convert Spanish floor descriptions into numbers ($Sotano \rightarrow -1, Bajo \rightarrow 0, Entreplanta \rightarrow 0.5$) so the model can understand building height as a continuous scale. Besides, I merge the two separate `heating` checkboxes into a single factor column with three clear choices: "central", "individual", or "none". Lately, I combined `n_rooms` and `n_bathrooms` into a single variable `total_room`.
+
+To handle the massive price differences between Madrid neighborhoods, I create a location based `target` variable. A fixed price threshold does not work well because a specific rent might buy a luxury apartment in a working class area, but only a small studio in a premium district. To fix this, I **group the data by district and use the local 25th and 75th percentiles** to label each property **.** This creates a clean, ordered category for our **`target`:** Low (bottom 25%), Fair (middle 50%), and High (top 25%) .
+
+For the final modeling, I must prevent data leakage. I delete raw room counts, helper variables, and avg_m2_price (since it contains future market averages that would let the model cheat). While I calculate these percentiles on the whole dataset here for data cleaning, the actual machine learning workflow calculates the quartile boundaries only from the training data. I then map these exact boundaries onto the test data, ensuring a fair validation and reliable results on any computer.
+
+```{r}
+#| echo: true
+#| label: data-cleaning
+
+
+remove_accents <- function(x) stri_trans_general(as.character(x), "Latin-ASCII")
+clean_data <- raw_data |>
+  dplyr::select(where(~ !all(is.na(.x)))) |>
+  mutate(across(
+    c(title, subtitle, raw_address, street_name, floor, neighborhood_id, energy_certificate),
+    ~ remove_accents(.x)
+  )) |>
+  extract(
+    neighborhood_id,
+    into = c("barrio", "avg_m2_price", "district"),
+    regex = "Neighborhood \\d+: (.+) \\((.+) .+/m2\\) - District \\d+: (.+)",
+    convert = TRUE
+  ) |>
+  mutate(
+    is_exterior = case_when(
+      str_detect(floor, "exterior") ~ TRUE,
+      str_detect(floor, "interior") ~ FALSE,
+      TRUE ~ is_exterior
+    ),
+    floor_temp = floor |>
+      str_replace_all("Semi-sotano", "-0.5") |>
+      str_replace_all("Sotano", "-1") |>
+      str_replace_all("Bajo", "0") |>
+      str_replace_all("Entreplanta", "0.5"),
+    floor = parse_number(floor_temp),
+    floor = replace_na(floor, 0),
+    energy_certificate = case_when(
+      energy_certificate %in% c("A", "B", "C", "D", "E", "F", "G") ~ energy_certificate,
+      TRUE ~ "unknown"
+    ),
+    energy_certificate = factor(energy_certificate,
+      levels = c("A", "B", "C", "D", "E", "F", "G", "unknown"),
+      ordered = TRUE
+    ),
+    heating_type = case_when(
+      has_central_heating == TRUE ~ "central",
+      has_individual_heating == TRUE ~ "individual",
+      TRUE ~ "none"
+    ),
+    total_room = n_bathrooms + n_rooms
+  ) |>
+  filter(!is.na(rent_price), rent_price > 0) |>
+  group_by(district) |>
+  mutate(
+    med = median(rent_price, na.rm = TRUE),
+    q25 = quantile(rent_price, 0.25, na.rm = TRUE),
+    q75 = quantile(rent_price, 0.75, na.rm = TRUE),
+    target = case_when(
+      rent_price < q25 ~ "Low",
+      rent_price > q75 ~ "High",
+      TRUE ~ "Fair"
+    ),
+    target = factor(target, levels = c("Low", "Fair", "High"))
+  ) |>
+  ungroup() |>
+  mutate(
+    across(where(is.character), as.factor),
+    across(where(is.logical), as.factor)
+  ) |>
+  dplyr::select(-c(
+    id, floor_temp, "...1", avg_m2_price, buy_price, buy_price_by_area,
+    street_name, street_number, operation, subtitle, raw_address, title,
+    is_floor_under, is_rent_price_known, is_buy_price_known,
+    med, q25, q75, has_central_heating, has_individual_heating,
+    n_bathrooms, n_rooms
+  ))
+```
+
+## Why area-relative thresholds?
+
+```{r}
+#| label: fig-district-box
+#| fig-height: 3.2
+#| fig-width: 6.5
+
+clean_data |>
+  mutate(district = fct_reorder(district, rent_price, median)) |>
+  ggplot(aes(rent_price, district)) +
+  geom_boxplot(outlier.size = 0.4, outlier.alpha = 0.3, linewidth = 0.4) +
+  scale_x_continuous(labels = scales::comma) +
+  labs(x = "Monthly Rent (EUR)", y = NULL) +
+  theme_minimal(base_size = 9)
+```
+
+@fig-district-box confirms the segmentation: medians range from around 700 EUR in the cheapest districts to over 1500 EUR in the most expensive. A property at 900 EUR would be overpriced in Villaverde but underpriced in Chamberi. Using district specific thresholds makes the classification much more meaningful.
+
+## Preprocessing recipe
+
+```{r}
+#| label: split
+#| cache: true
+#| dependson: "data-load"
+
+set.seed(20260513)
+data_split <- initial_split(clean_data, prop = 0.8, strata = target)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+cv_folds <- vfold_cv(train_data, v = 10, strata = target)
+
+district_ref <- train_data |>
+  group_by(district) |>
+  summarise(
+    q25 = quantile(rent_price, 0.25, na.rm = TRUE),
+    q75 = quantile(rent_price, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r}
+#| label: recipe
+#| echo: true
+#| cache: true
+#| dependson: split
+
+rec_linear <- recipe(rent_price ~ ., data = train_data) |>
+  step_rm(target) |>
+  step_filter_missing(all_predictors(), threshold = 0.5) |>
+  step_impute_knn(all_numeric_predictors(), neighbors = 5) |>
+  step_impute_mode(all_factor()) |>
+  step_lencode_mixed(barrio, outcome = vars(rent_price)) |> 
+  step_ns(floor, deg_free = 3) |> 
+  step_nzv(all_predictors()) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_interact(terms = ~ starts_with("floor"):starts_with("has_lift")) |> 
+  step_normalize(all_numeric_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_pls(all_numeric_predictors(), outcome = "rent_price", num_comp = 3)
+
+rec_tree <- recipe(rent_price ~ ., data = train_data) |>
+  step_rm(target) |>
+  step_filter_missing(all_predictors(), threshold = 0.5) |>
+  step_impute_knn(all_numeric_predictors(), neighbors = 5) |>
+  step_impute_mode(all_factor()) |>
+  step_lencode_mixed(barrio, outcome = vars(rent_price)) |> 
+  step_nzv(all_predictors()) |>
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) |> 
+  step_zv(all_predictors())
+```
+
+`step_filter_missing` drops columns with more than 50% missing values. KNN imputation (`k = 5`) for numeric variables because it is more better than mean imputation; mode is used for factors. Yeo-Johnson reduces skewness in the numeric predictors. 
+
+Parametric structures were fed into a specialized preprocessing pipeline featuring Mixed-Effect Target Encoding `step_lencode_mixed()` to extract local signals from high-cardinality neighborhood vectors `barrio` without degrees of freedom expansion. Multi-collinearity among real estate geometry variables was resolved using a supervised Partial Least Squares Regression `step_pls` dimensional compression.
+
+# Modeling and Validation
+
+## Model specifications
+
+The Elastic Net serves as a linear baseline. Random Forest and XGBoost are both included because they handle non-linearities and interactions between features that a linear model cannot capture. The number of trees is fixed (200 for RF, 250 for XGBoost) to keep tuning tractable, and the most impactful hyperparameters are searched instead.
+
+## Race-ANOVA tuning with workflow_set
+
+`workflow_set` [@workflowsets] lets me define two different recipes for different models at once and tune them together. `tune_race_anova` [@finetune] is an efficient alternative to evaluating all 20 grid configurations on all 10 folds: after each resample it eliminates distinguishable parameters from the current set, stopping early.
+
+```{r}
+#| label: tuning
+#| cache: true
+#| dependson: "recipe"
+#| output: false
+
+lm_spec <- linear_reg(penalty = tune(), mixture = tune()) |>
+  set_engine("glmnet")
+
+rf_spec <- rand_forest(mtry = tune(), min_n = tune(), trees = 200) |>
+  set_engine("ranger", num.threads = 1, importance = "impurity") |>
+  set_mode("regression")
+
+xgb_spec <- boost_tree(
+  trees = 250, tree_depth = tune(), learn_rate = tune(), min_n = tune()
+) |>
+  set_engine("xgboost", nthread = 1) |>
+  set_mode("regression")
+
+model_set <- workflow_set(
+  preproc = list(linear_pipe = rec_linear, tree_pipe = rec_tree),
+  models  = list(elastic_net = lm_spec, random_forest = rf_spec, xgboost = xgb_spec),
+  cross = TRUE
+) |> 
+  filter(!(wflow_id %in% c("linear_pipe_random_forest", "linear_pipe_xgboost")))
+
+plan(multisession, workers = 4)
+options(future.globals.maxSize = 4000 * 1024^2)
+
+set.seed(20260513)
+all_tune_results <- model_set |>
+  workflow_map(
+    fn        = "tune_race_anova",
+    resamples = cv_folds,
+    grid      = 20,
+    metrics   = metric_set(rmse, rsq),
+    control   = control_race(verbose_elim = FALSE, save_pred = FALSE)
+  )
+
+plan(sequential)
+```
+
+```{r}
+#| label: finalise
+#| cache: true
+#| dependson: "tuning"
+
+best_summary <- rank_results(all_tune_results, rank_metric = "rmse", select_best = TRUE)
+
+best_wflow_id <- best_summary$wflow_id[1]
+
+best_wflow <- model_set |> 
+  extract_workflow(best_wflow_id)
+
+best_params <- all_tune_results |>
+  extract_workflow_set_result(best_wflow_id) |>
+  select_best(metric = "rmse")
+
+final_fit <- best_wflow |>
+  finalize_workflow(best_params) |>
+  last_fit(split = data_split)
+
+collect_metrics(final_fit)
+
+prediction_analysis <- final_fit |>
+  collect_predictions() |>
+  bind_cols(test_data |> dplyr::select(district,barrio,target)) |>
+  left_join(district_ref, by = "district") |>
+  mutate(
+    pred_price = .pred,
+    pred_class = case_when(
+      pred_price < q25 ~ "Low",
+      pred_price > q75 ~ "High",
+      TRUE ~ "Fair"
+    ),
+    pred_class = factor(pred_class, levels = c("Low", "Fair", "High")),
+    price_diff = rent_price - pred_price
+  )
+```
+
+# Results
+
+## Model comparison
+
+```{r}
+#| label: fig-autoplot
+#| fig-cap: "CV RMSE for all three models across hyperparameter configurations retained by race-ANOVA. Lower is better."
+#| fig-height: 3
+#| fig-width: 6
+
+autoplot(all_tune_results, metric = "rmse") +
+  theme_minimal(base_size = 9) +
+  labs(y = "CV RMSE (EUR)", x = "Configuration (race-ANOVA retained)")
+```
+
+As @fig-autoplot shows, Random Forest edges out XGBoost a little in cross validated RMSE, but both tree models outperform the Elastic Net.
+
+## Test-set performance
+
+```{r}
+#| label: tbl-test-metrics
+#| tbl-cap: "Final testset metrics for the selected model."
+
+cm <- conf_mat(prediction_analysis, truth = target, estimate = pred_class)
+
+final_metrics <- collect_metrics(final_fit) |>
+  dplyr::select(.metric, .estimate) |>
+  bind_rows(tibble(
+    .metric = "class_accuracy",
+    .estimate = accuracy(prediction_analysis,
+      truth = target,
+      estimate = pred_class
+    )$.estimate
+  )) |>
+  mutate(
+    Metric = c("RMSE", "R squared", "Accuracy"),
+    Value  = round(.estimate, 3)
+  ) |>
+  dplyr::select(Metric, Value)
+
+kable(final_metrics, booktabs = TRUE, linesep = "") |>
+  kable_styling(font_size = 9, latex_options = "hold_position")
+```
+
+The final Random Forest model explains around 82.8\% of rent variance, with test RMSE of about 249 EUR. On classification, accuracy is 75.8\%.
+
+```{r}
+#| label: fig-confmat
+#| fig-cap: "Confusion matrix heatmap for the three-class price tier classification."
+#| fig-height: 2.6
+#| fig-width: 3.4
+
+autoplot(cm, type = "heatmap") +
+  theme_minimal(base_size = 9) +
+  theme(legend.position = "none")
+```
+
+The confusion matrix (@fig-confmat) shows that most errors are between classes: Low predicted as Fair, or Fair as High. Very few properties are misclassified across the full span (Low predicted as High). This is reassuring: the continuous regression output means the model still captures relative price ordering.
+
+## Predicted vs. actual and residuals
+
+```{r}
+#| label: fig-pred-actual
+#| fig-cap: "Left: predicted vs. actual rent with identity line (dashed). Right: residuals vs. actual rent with a loess smoother."
+#| fig-height: 2.8
+#| fig-width: 6.5
+
+p1 <- ggplot(prediction_analysis, aes(pred_price, rent_price)) +
+  geom_point(alpha = 0.2, size = 0.6) +
+  geom_abline(linetype = "dashed", colour = "firebrick") +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = "Predicted (EUR)", y = "Actual (EUR)") +
+  theme_minimal(base_size = 9)
+
+p2 <- ggplot(prediction_analysis, aes(rent_price, price_diff)) +
+  geom_point(alpha = 0.2, size = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "firebrick") +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 0.7, colour = "steelblue") +
+  scale_x_continuous(labels = scales::comma) +
+  labs(x = "Actual Rent (EUR)", y = "Residual (EUR)") +
+  theme_minimal(base_size = 9)
+
+p1+p2
+```
+
+Predictions track actual values well up to around 2000 EUR (@fig-pred-actual, left). The residual plot reveals the model underestimates luxury properties. This is expected: higher quality rentals depend on features like renovation quality and building prestige that are not in the data.
+
+## Feature importance
+
+```{r}
+#| label: fig-vip
+#| fig-cap: "Top 15 predictors by gain importance for the final model."
+#| fig-height: 3
+#| fig-width: 5.5
+
+final_fit |>
+  extract_fit_parsnip() |>
+  vip::vip(num_features = 15, aesthetics = list(fill = "midnightblue", alpha = 0.8)) +
+  theme_minimal(base_size = 9) +
+  labs(x = "Importance", y = NULL)
+```
+
+The `squre_meter_built` feature ranks first by a large margin (@fig-vip). `Barrio` is also important to tenant which is related to the safety of the area. Lift availability (`has_lift`) comes fourth, which likely acts as a proxy for building age and general quality. `Floor` level, `parking` and several district indicators follow, confirming that both vertical position and location matter.
+
+Also we can that north areas have more higher ranks than other areas. That maybe related with tenants' working accessibilities.
+
+## District level error
+
+```{r}
+#| label: tbl-district
+#| tbl-cap: "Testset RMSE by district (top 8)."
+
+prediction_analysis |>
+  group_by(district) |>
+  summarise(
+    n = n(),
+    RMSE = round(sqrt(mean(price_diff^2, na.rm = TRUE)), 0),
+    .groups = "drop"
+  ) |>
+  filter(n >= 30) |>
+  arrange(desc(RMSE)) |>
+  slice_head(n = 8) |>
+  kable(booktabs = TRUE, linesep = "") |>
+  kable_styling(font_size = 9, latex_options = "hold_position")
+```
+
+Errors are higher in central and upmarket districts (@tbl-district), which tend to have more transportation convenience and affluent members.
+
+# Conclusions
+
+Framing the rent prediction problem as a district relative classification turns out to work well. By first predicting a continuous rent and then converting it using locally calibrated thresholds, the pipeline separates the regression task from the interpretation layer. The final Random Forest model achieves 75.8\% classification accuracy, well above the 51% majority baseline and errors are mostly between adjacent tiers rather than across the full span.
+
+# References
+
+::: {#refs}
+:::
+
+# Appendices
+
+```{r}
+sessionInfo()
+```
